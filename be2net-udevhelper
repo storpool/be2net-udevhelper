@@ -74,7 +74,7 @@ fi
 
 case "$ACTION" in
 	add)
-		if [ -L "/sys/class/net/$INTERFACE/device/physfn" ]; then
+		if [ -L "/sys/class/net/$INTERFACE/device/sriov_numvfs" ]; then
 			PCI_ARRAY=(${PCI_SLOT_LIST//,/ })
 			PCI_NUMVFS=(${PCI_NUMVFS_LIST//,/ })
 			if [ "$PCI_SLOT_NAME" = "" ]; then
@@ -114,7 +114,7 @@ case "$ACTION" in
 			fi
 
 			echo "$PFNAME"
-		else
+		elif [ -L "/sys/${DEVPATH}/../../physfn" ]; then
 			PFNAME="$(ls /sys/${DEVPATH}/../../physfn/net)"
 			VFID=`getVirtfnId $DEVPATH`
 			createVFNAME
