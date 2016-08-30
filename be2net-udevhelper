@@ -1,0 +1,200 @@
+#!/bin/bash
+# The MIT License (MIT)
+#
+# Copyright (c) 2016 StorPool Storage AD
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+#---------------------------------------------------------------------------
+# This file should be placed in /lib/udev/
+#
+# It is called for each ethernet device.
+# 1. When callend on the PF context the number VFs is set
+# 2. When called on the VF context the interface is renamed
+
+set -e
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:$PATH
+
+NUMVFS_DELAY_WRITE="${NUMVFS_DELAY_WRITE:-1}"
+
+RENAME_VF_INTERFACE="yes"
+VF_UP_BEFORE_MTU="yes"
+
+function splog()
+{
+	logger -t "[$SEQNUM] ${0##*/}" "[$INTERFACE] $*"
+}
+
+function getVirtfnId()
+{
+	local _DEVPATH="${1%/net/*}"
+	local _PCISLOTNAME="${_DEVPATH##*/}"
+	local _UEVENT="$(grep -H "PCI_SLOT_NAME=$_PCISLOTNAME" /sys/${_DEVPATH}/physfn/virtfn*/uevent)"
+	local _VF="${_UEVENT%/uevent*}"
+	echo "${_VF#*virtfn}"
+}
+
+function createVFNAME()
+{
+	VFNAME_TEMPLATE=${VFNAME_TEMPLATE:-_PFNAME__vf_VFID_}
+	VFNAME="${VFNAME_TEMPLATE//_PFNAME_/$PFNAME}"
+	VFNAME="${VFNAME//_VFID_/$VFID}"
+}
+
+if [ -f "/etc/be2net-udevhelper.conf" ]; then
+	source "/etc/be2net-udevhelper.conf"
+fi
+
+if [ "$DRIVER" = "" ]; then
+	DRIVER="$(readlink /sys/$DEVPATH/device/driver || true)"
+	DRIVER="${DRIVER##*/}"
+fi
+
+if [ -n "$DEBUG" ]; then
+	splog "DRIVER=$DRIVER DEVPATH=$DEVPATH"
+fi
+
+case "$ACTION" in
+	add)
+		if [ -L "/sys/class/net/$INTERFACE/device/physfn" ]; then
+			PCI_ARRAY=(${PCI_SLOT_LIST//,/ })
+			PCI_NUMVFS=(${PCI_NUMVFS_LIST//,/ })
+			if [ "$PCI_SLOT_NAME" = "" ]; then
+				PCI_SLOT_NAME=${DEVPATH%/net*}
+				PCI_SLOT_NAME=${PCI_SLOT_NAME##*/}
+			fi
+			for i in ${!PCI_ARRAY[@]}; do
+				NUMVFS="${PCI_NUMVFS[i]}"
+				if [ -n "$DEBUG" ]; then
+					splog "$i $PCI_SLOT_NAME PCI_SLOT ${PCI_ARRAY[i]} NUMVFS $NUMVFS"
+				fi
+				if [ "${PCI_ARRAY[i]}" != "$PCI_SLOT_NAME" ]; then
+					continue
+				fi
+				if [ "${NUMVFS//[[:digit:]]/}" = ""  ] ; then
+					splog "enabling $NUMVFS VF on PCI slot $PCI_SLOT_NAME ${NUMVFS_DELAY_WRITE:+delay $NUMVFS_DELAY_WRITE}"
+					if [ -n "$NUMVFS_DELAY_WRITE" ]; then
+						sleep "$NUMVFS_DELAY_WRITE"
+					fi
+					echo "$NUMVFS" >"/sys/class/net/$INTERFACE/device/sriov_numvfs"
+				else
+					splog "no PCI_NUMVFS set for $PCI_SLOT_NAME"
+				fi
+			done
+
+			PFNAME=$INTERFACE
+			eval "PFMTU=\${${PFNAME}_MTU}"
+			if [ "${PFMTU//[[:digit:]]/}" != ""  ] ; then
+				splog "Warning! ${PFNAME}_MTU=$PFMTU looks like not MTU! Skipping mtu setup."
+				PFMTU=
+			fi
+			OLDMTU=`ip link show $PFNAME | head -n 1 | awk '{print $5}'`
+			# change PF MTU if differ
+			if [ -n "$PFMTU" ] && [ "$PFMTU" != "$OLDMTU" ]; then
+				ip link set dev "$PFNAME" mtu $PFMTU &>/dev/null
+				splog "ip link set dev $PFNAME mtu $PFMTU (ret:$?) #OLDMTU:$OLDMTU"
+			fi
+
+			echo "$PFNAME"
+		else
+			PFNAME="$(ls /sys/${DEVPATH}/../../physfn/net)"
+			VFID=`getVirtfnId $DEVPATH`
+			createVFNAME
+			if [ "$VFNAME" = "$INTERFACE" ]; then
+				if [ -n "$DEBUG" ]; then
+					splog "Skipping VF interface name same as PARENT ${VFNAME}. Skipping..."
+				fi
+				exit
+			fi
+			VFMAC="$(</sys/${DEVPATH}/address)"
+			eval "VFVLAN=\${${VFNAME}_VLAN}"
+			if [ "${VFVLAN//[[:digit:]]/}" != ""  ] ; then
+				splog "Warning! ${VFNAME}_VLAN=$VFVLAN looks like not VLAN_ID! Skipped vlan setup."
+				VFVLAN=
+			fi
+			eval "VFMTU=\${${VFNAME}_MTU}"
+			if [ "${VFMTU//[[:digit:]]/}" != ""  ] ; then
+				splog "Warning! ${VFNAME}_MTU=$VFMTU looks like not MTU! Skipping mtu setup."
+				VFMTU=
+			else
+				PFMTU="${$PFMTU:-$VFMTU}"
+			fi
+			eval "VFSPOOFCHK=\${${VFNAME}_SPOOFCHK}"
+			if [ -n "$VFSPOOFCHK" ] && [ "$VFSPOOFCHK" != 'on' ] && [ "$VFSPOOFCHK" != "off" ]; then
+				splog "Warning! ${VFNAME}_SPOOFCHK=$VFSPOOFCHK must be 'on' or 'off'. Skipping spoof check setup."
+				VFSPOOFCHK=
+			fi
+
+			if [ -n "$DEBUG" ]; then
+				splog "PFNAME=$PFNAME VFNAME=$VFNAME${VFVLAN:+ VFVLAN=$VFVLAN}${VFMTU:+ VFMTU=$VFMTU}${VFSPOOFCHK:+ VFSPOOFCHK=$VFSPOOFCHK}"
+			fi
+
+			eval "PF_NO_UP=\${${PFNAME}_NO_UP}"
+			# bring PF interface up by default
+			if [ "$PF_NO_UP" != "yes"] || [ "$PF_NO_UP" != "1"]; then
+				OLDSTATE=`ip link show "$PFNAME" up | wc -l`
+				if [ $OLDSTATE -eq 0 ]; then
+					ip link set dev "$PFNAME" up &>/dev/null
+					splog "ip link set dev $PFNAME up (ret:$?)"
+				elif [ -n "$DEBUG" ]; then
+					splog "the interface is already up"
+				fi
+			fi
+
+			# set MAC filtering for the VF
+			ip link set "$PFNAME" vf "$VFID" mac ${VFMAC} &>/dev/null
+			splog "ip link set $PFNAME vf $VFID mac ${VFMAC} (ret:$?)"
+
+			if [ -n "$VFVLAN" ]; then
+				# set VLAN filtering for the VF
+				ip link set "$PFNAME" vf "$VFID" vlan $VFVLAN &>/dev/null
+				splog "ip link set $PFNAME vf $VFID vlan $VFVLAN (ret:$?)"
+			fi
+
+			if [ -n "$VFSPOOFCHK" ]; then
+				# set VF spoof check
+				ip link set dev "$PFNAME" vf "$VFID" spoofchk "$VFSPOOFCHK" &>/dev/null
+				splog "ip link set dev $PFNAME vf $VFID spoofchk $VFSPOOFCHK (ret:$?)" &>/dev/null
+			fi
+
+			if [ "$RENAME_VF_INTERFACE" = "yes" ]; then
+				ip link set "$INTERFACE" name "${VFNAME}" &>/dev/null
+				splog "ip link set $INTERFACE name $VFNAME (ret:$?)"
+				IFNAME="$VFNAME"
+			else
+				IFNAME="$INTERFACE"
+			fi
+
+			if [ -n "$VFMTU" ]; then
+				# first bring the VF interface up
+				if [ "$VF_UP_BEFORE_MTU" = "yes" ] || [ "$VF_UP_BEFORE_MTU" = "1" ]; then
+					ip link set dev "$IFNAME" up &>/dev/null
+					splog "ip link set dev $IFNAME up (ret:$?)"
+				fi
+				# set MTU for the VF
+				ip link set dev "$IFNAME" mtu $VFMTU &>/dev/null
+				splog "ip link set dev $IFNAME mtu $VFMTU (ret:$?)"
+			fi
+			# return the new VF interface name
+			echo "$VFNAME"
+		fi
+	;;
+esac
