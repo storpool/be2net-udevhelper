@@ -74,7 +74,7 @@ fi
 
 case "$ACTION" in
 	add)
-		if [ -L "/sys/class/net/$INTERFACE/device/sriov_numvfs" ]; then
+		if [ -f "/sys/class/net/$INTERFACE/device/sriov_numvfs" ]; then
 			PCI_ARRAY=(${PCI_SLOT_LIST//,/ })
 			PCI_NUMVFS=(${PCI_NUMVFS_LIST//,/ })
 			if [ "$PCI_SLOT_NAME" = "" ]; then
