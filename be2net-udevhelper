@@ -40,7 +40,7 @@ VF_UP_BEFORE_MTU="yes"
 
 function splog()
 {
-	logger -t "[$SEQNUM] ${0##*/}" "[$INTERFACE] $*"
+	logger -t "[$SEQNUM] ${0##*/}" -- "[$INTERFACE] $*"
 }
 
 function getVirtfnId()
